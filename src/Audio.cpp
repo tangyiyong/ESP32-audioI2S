@@ -3,8 +3,8 @@
  *
  *  Created on: Oct 26.2018
  *
- *  Version 3.0.8x
- *  Updated on: Apr 01.2024
+ *  Version 3.0.9a
+ *  Updated on: Apr 04.2024
  *      Author: Wolle (schreibfaul1)
  *
  */
@@ -329,8 +329,9 @@ void Audio::setDefaults() {
     m_f_ssl = false;
     m_f_metadata = false;
     m_f_tts = false;
-    m_f_firstCall = true;     // InitSequence for processWebstream and processLokalFile
-    m_f_firstM3U8call = true; // InitSequence for parsePlaylist_M3U8
+    m_f_firstCall = true;        // InitSequence for processWebstream and processLocalFile
+    m_f_firstCurTimeCall = true; // InitSequence for compute_audioCurrentTime
+    m_f_firstM3U8call = true;    // InitSequence for parsePlaylist_M3U8
     m_f_running = false;
     m_f_loop = false;     // Set if audio file should loop
     m_f_unsync = false;   // set within ID3 tag but not used
@@ -2243,11 +2244,12 @@ uint32_t Audio::stopSong() {
         // added this before putting 'm_f_localfile = false' in stopSong(); shoulf never occur....
         audiofile.close();
         AUDIO_INFO("Closing audio file");
-        log_w("Closing audio file"); // for debug
     }
     memset(m_outBuff, 0, m_outbuffSize); // Clear OutputBuffer
     memset(m_filterBuff, 0, sizeof(m_filterBuff)); // Clear FilterBuffer
     m_validSamples = 0;
+    m_audioCurrentTime = 0;
+    m_audioFileDuration = 0;
     return pos;
 }
 //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -3227,7 +3229,7 @@ void Audio::processWebFile() {
     const uint32_t  maxFrameSize = InBuff.getMaxBlockSize(); // every mp3/aac frame is not bigger
     static bool     f_stream;                                // first audio data received
     static bool     f_webFileDataComplete;                   // all file data received
-    static uint32_t byteCounter; 
+    static uint32_t byteCounter;
     static uint32_t chunkSize;                               // chunkcount read from stream
     static size_t   audioDataCount;                          // counts the decoded audiodata only
 
@@ -4316,18 +4318,30 @@ void Audio::setDecoderItems() {
         setSampleRate(FLACGetSampRate());
         setBitsPerSample(FLACGetBitsPerSample());
         setBitrate(FLACGetBitRate());
+        if(FLACGetAudioDataStart() > 0){ // only flac-ogg, native flac sets audioDataStart in readFlacHeader()
+            m_audioDataStart = FLACGetAudioDataStart();
+            if(getFileSize()) m_audioDataSize = getFileSize() - m_audioDataStart;
+        }
     }
     if(m_codec == CODEC_OPUS) {
         setChannels(OPUSGetChannels());
         setSampleRate(OPUSGetSampRate());
         setBitsPerSample(OPUSGetBitsPerSample());
         setBitrate(OPUSGetBitRate());
+        if(OPUSGetAudioDataStart() > 0){
+            m_audioDataStart = OPUSGetAudioDataStart();
+            if(getFileSize()) m_audioDataSize = getFileSize() - m_audioDataStart;
+        }
     }
     if(m_codec == CODEC_VORBIS) {
         setChannels(VORBISGetChannels());
         setSampleRate(VORBISGetSampRate());
         setBitsPerSample(VORBISGetBitsPerSample());
         setBitrate(VORBISGetBitRate());
+        if(VORBISGetAudioDataStart() > 0){
+            m_audioDataStart = VORBISGetAudioDataStart();
+            if(getFileSize()) m_audioDataSize = getFileSize() - m_audioDataStart;
+        }
     }
     if(getBitsPerSample() != 8 && getBitsPerSample() != 16) {
         AUDIO_INFO("Bits per sample must be 8 or 16, found %i", getBitsPerSample());
@@ -4474,7 +4488,10 @@ int Audio::sendBytes(uint8_t* data, size_t len) {
         m_PlayingStartTime = millis();
     }
 
-    compute_audioCurrentTime(bytesDecoded);
+    uint16_t bytesDecoderOut = m_validSamples;
+    if(m_channels == 2) bytesDecoderOut /= 2;
+    if(m_bitsPerSample == 16) bytesDecoderOut *= 2;
+    compute_audioCurrentTime(bytesDecoded, bytesDecoderOut);
 
     if(audio_process_extern) {
         bool continueI2S = false;
@@ -4486,50 +4503,53 @@ int Audio::sendBytes(uint8_t* data, size_t len) {
     return bytesDecoded;
 }
 //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-void Audio::compute_audioCurrentTime(int bd) {
-    static uint16_t loop_counter = 0;
-    static int      old_bitrate = 0;
-    static uint64_t sum_bitrate = 0;
-    static boolean  f_CBR = true; // constant bitrate
-    static uint8_t  cnt = 0;
+void Audio::compute_audioCurrentTime(uint16_t bytesDecoderIn, uint16_t bytesDecoderOut) {
 
-    if(m_codec == CODEC_MP3) { setBitrate(MP3GetBitrate()); }   // if not CBR, bitrate can be changed
-    if(m_codec == CODEC_M4A) { setBitrate(AACGetBitrate()); }   // if not CBR, bitrate can be changed
-    if(m_codec == CODEC_AAC) { setBitrate(AACGetBitrate()); }   // if not CBR, bitrate can be changed
-    if(m_codec == CODEC_FLAC) { setBitrate(FLACGetBitRate()); } // if not CBR, bitrate can be changed
+    if(getDatamode() != AUDIO_LOCALFILE && m_streamType != ST_WEBFILE) return; //guard
 
-    //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    if(m_avr_bitrate == 0) { // first time
-        loop_counter = 1;
-        old_bitrate = 0;
-        sum_bitrate = 0;
-        f_CBR = true;
-        m_avr_bitrate = getBitRate();
-        old_bitrate = getBitRate();
-        cnt = 0;
-    }
-    if(!getBitRate()) return;
-    //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    static uint64_t sumBytesIn   = 0;
+    static uint64_t sumBytesOut  = 0;
+    static uint32_t sumBitRate   = 0;
+    static uint32_t counter      = 0;
+    static uint32_t timeStamp    = 0;
+    static uint32_t deltaBytesIn = 0;
+    static float    audioCurrentTime = 0;
+    float compressionRatio = 0;
 
-    if((old_bitrate != getBitRate()) && f_CBR) {
-        if(audio_info) audio_info("VBR recognized, audioFileDuration is estimated");
-        f_CBR = false; // variable bitrate
-    }
-    old_bitrate = getBitRate();
-
-    if(loop_counter < 10000) { // then the bit rate is determined with sufficient precision
-        sum_bitrate += getBitRate();
-        m_avr_bitrate = sum_bitrate / loop_counter;
-        loop_counter++;
+    if(m_f_firstCurTimeCall) { // first call
+        m_f_firstCurTimeCall = false;
+        sumBytesIn = 0;
+        sumBytesOut = 0;
+        sumBitRate  = 0;
+        counter = 0;
+        timeStamp = millis();
+        deltaBytesIn = 0;
+        audioCurrentTime = 0;
     }
 
-    m_audioCurrentTime += ((float)bd / m_avr_bitrate) * 8;
+    sumBytesIn   += bytesDecoderIn;
+    deltaBytesIn += bytesDecoderIn;
+    sumBytesOut  += bytesDecoderOut;
 
-    if(cnt == 1) {
-        m_audioCurrentTime = ((float)(getFilePos() - m_audioDataStart - inBufferFilled()) / m_avr_bitrate) * 8; // #293
+    if(timeStamp + 950 < millis()){
+        // compressionRatio = (float)sumBytesIn / sumBytesOut;
+        (void) compressionRatio; // unused yet
+
+        uint32_t t       = millis();
+        uint32_t delta_t = t - timeStamp;
+        timeStamp = t;
+        // we know the time and bytesIn to compute the bitrate
+        uint32_t bitRate = ((deltaBytesIn * 8000) / delta_t);
+
+        sumBitRate += bitRate;
+        counter ++;
+        m_avr_bitrate = sumBitRate / counter;
+
+        audioCurrentTime += ((float)(deltaBytesIn * 8) / m_avr_bitrate);
+
+        m_audioCurrentTime = audioCurrentTime;
+        deltaBytesIn = 0;
     }
-    cnt++;
-    if(cnt == 100) cnt = 0;
 }
 //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  void Audio::printProcessLog(int r, const char* s){
@@ -4696,13 +4716,10 @@ bool Audio::setPinout(uint8_t BCLK, uint8_t LRC, uint8_t DOUT, int8_t MCLK) {
     return (result == ESP_OK);
 }
 //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-uint32_t Audio::getFileSize() {
+uint32_t Audio::getFileSize() { // returns the size of webfile or local file
     if(!audiofile) {
-        if (m_contentlength > 0) {
-            return m_contentlength;
-        } else {
-            return 0;
-        }
+        if (m_contentlength > 0) { return m_contentlength;}
+        return 0;
     }
     return audiofile.size();
 }
@@ -4725,13 +4742,8 @@ uint32_t Audio::getAudioFileDuration() {
         if(!m_contentlength) return 0;
     }
 
-    if(m_avr_bitrate && m_codec == CODEC_MP3) m_audioFileDuration = 8 * ((float)m_audioDataSize / m_avr_bitrate); // #289
-    else if(m_avr_bitrate && m_codec == CODEC_WAV) m_audioFileDuration = 8 * ((float)m_audioDataSize / m_avr_bitrate);
-    else if(m_avr_bitrate && m_codec == CODEC_M4A) m_audioFileDuration = 8 * ((float)m_audioDataSize / m_avr_bitrate);
-    else if(m_avr_bitrate && m_codec == CODEC_AAC) m_audioFileDuration = 8 * ((float)m_audioDataSize / m_avr_bitrate);
-    else if(m_codec == CODEC_FLAC) m_audioFileDuration = FLACGetAudioFileDuration();
-    else return 0;
-    return m_audioFileDuration;
+    if(!m_avr_bitrate) return 0;
+    return m_audioFileDuration = 8 * ((float)m_audioDataSize / m_avr_bitrate);
 }
 //------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 uint32_t Audio::getAudioCurrentTime() { // return current time in seconds
@@ -4790,7 +4802,7 @@ bool Audio::setFilePos(uint32_t pos) {
     if(m_codec == CODEC_VORBIS) return false; // not impl. yet
     if(!audiofile) return false;
     if(pos < m_audioDataStart) pos = m_audioDataStart; // issue #96
-    if(pos > m_file_size) pos = m_file_size;
+    if(pos > m_file_size) {pos = m_file_size; stopSong(); return false;}
     m_resumeFilePos = pos;
     memset(m_outBuff, 0, m_outbuffSize);
     m_validSamples = 0;
@@ -6020,6 +6032,37 @@ uint32_t Audio::m4a_correctResumeFilePos(uint32_t resumeFilePos) {
     return pos;
 }
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+uint32_t Audio::ogg_correctResumeFilePos(uint32_t resumeFilePos) {
+    // The starting point is the next OggS magic word
+  log_w("in_resumeFilePos %i", resumeFilePos);
+
+    uint8_t  p1, p2, p3, p4;
+    boolean  found = false;
+    uint32_t pos = resumeFilePos;
+    audiofile.seek(pos);
+
+    p1 = audiofile.read();
+    p2 = audiofile.read();
+    p3 = audiofile.read();
+    p4 = audiofile.read();
+
+    pos += 4;
+    while(!found || pos >= m_file_size) {
+        if(p1 == 'O' && p2 == 'g'&& p3 == 'g' && p4 == 'S') {
+            found = true;
+            break;
+        }
+        p1 = p2;
+        p2 = p3;
+        p3 = p4;
+        p4 = audiofile.read();
+        pos++;
+    }
+    if(found) { log_w("out_resumeFilePos %i", pos - 4);    return (pos - 4);}
+    stopSong();
+    return 0;
+}
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 uint32_t Audio::flac_correctResumeFilePos(uint32_t resumeFilePos) {
     // The starting point is the next FLAC syncword
     uint8_t  p1, p2;
@@ -6030,7 +6073,7 @@ uint32_t Audio::flac_correctResumeFilePos(uint32_t resumeFilePos) {
     p1 = audiofile.read();
     p2 = audiofile.read();
     pos += 2;
-    while(!found || pos == m_file_size) {
+    while(!found || pos >= m_file_size) {
         if(p1 == 0xFF && p2 == 0xF8) {
             found = true;
             break;
@@ -6041,7 +6084,8 @@ uint32_t Audio::flac_correctResumeFilePos(uint32_t resumeFilePos) {
     }
 
     if(found) return (pos - 2);
-    return m_audioDataStart;
+    stopSong();
+    return 0;
 }
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 uint32_t Audio::mp3_correctResumeFilePos(uint32_t resumeFilePos) {

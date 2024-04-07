@@ -4,7 +4,7 @@
  * adapted to ESP32
  *
  * Created on: Jul 03,2020
- * Updated on: Apr 02,2024
+ * Updated on: Apr 04,2024
  *
  * Author: Wolle
  *
@@ -25,6 +25,7 @@ uint32_t         s_flacBlockPicLenUntilFrameEnd = 0;
 uint32_t         s_flacCurrentFilePos = 0;
 uint32_t         s_flacBlockPicPos = 0;
 uint32_t         s_flacBlockPicLen = 0;
+uint32_t         s_flacAudioDataStart = 0;
 int32_t          s_flacRemainBlockPicLen = 0;
 const uint16_t   s_flacOutBuffSize = 2048;
 uint16_t         s_blockSize = 0;
@@ -136,6 +137,7 @@ void FLACDecoder_setDefaults(){
     s_flacBlockPicPos = 0;
     s_flacBlockPicLen = 0;
     s_flacRemainBlockPicLen = 0;
+    s_flacAudioDataStart = 0;
     s_blockSize = 0;
     s_blockSizeLeft = 0;
     s_flacValidSamples = 0;
@@ -609,6 +611,9 @@ int8_t FLACDecode(uint8_t *inbuf, int *bytesLeft, short *outbuf){ //  MAIN LOOP
 
         if(nBytes > 0){
             int16_t diff = nBytes;
+            if(s_flacAudioDataStart == 0){
+                s_flacAudioDataStart = s_flacCurrentFilePos;
+            }
             ret = FLACDecodeNative(inbuf, &nBytes, outbuf);
             diff -= nBytes;
             s_flacCurrentFilePos += diff;
@@ -840,18 +845,22 @@ uint16_t FLACGetOutputSamps(){
 }
 //----------------------------------------------------------------------------------------------------------------------
 uint64_t FLACGetTotoalSamplesInStream(){
+    if(!FLACMetadataBlock) return 0;
     return FLACMetadataBlock->totalSamples;
 }
 //----------------------------------------------------------------------------------------------------------------------
 uint8_t FLACGetBitsPerSample(){
+    if(!FLACMetadataBlock) return 0;
     return FLACMetadataBlock->bitsPerSample;
 }
 //----------------------------------------------------------------------------------------------------------------------
 uint8_t FLACGetChannels(){
+    if(!FLACMetadataBlock) return 0;
     return FLACMetadataBlock->numChannels;
 }
 //----------------------------------------------------------------------------------------------------------------------
 uint32_t FLACGetSampRate(){
+    if(!FLACMetadataBlock) return 0;
     return FLACMetadataBlock->sampleRate;
 }
 //----------------------------------------------------------------------------------------------------------------------
@@ -859,8 +868,12 @@ uint32_t FLACGetBitRate(){
     return s_flacBitrate;
 }
 //----------------------------------------------------------------------------------------------------------------------
+uint32_t FLACGetAudioDataStart(){
+    return s_flacAudioDataStart;
+}
+//----------------------------------------------------------------------------------------------------------------------
 uint32_t FLACGetAudioFileDuration() {
-    if(FLACGetSampRate()){
+    if(FLACGetSampRate()){ // DIV0
         uint32_t afd = FLACGetTotoalSamplesInStream()/ FLACGetSampRate(); // AudioFileDuration
         return afd;
     }
